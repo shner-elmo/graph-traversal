@@ -1,5 +1,5 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use graphdb::Data;
+use graph_traversal::Data;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufReader;
