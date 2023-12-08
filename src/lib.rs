@@ -3,8 +3,12 @@ use std::cmp::Eq;
 use std::hash::Hash;
 use std::iter::FusedIterator;
 use std::usize;
+use std::hash::BuildHasherDefault;
 
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use indexmap::IndexSet;
+use rustc_hash::{FxHasher, FxHashMap  as HashMap};
+
+type FxIndexSet<T> = IndexSet<T, BuildHasherDefault<FxHasher>>;
 
 /// The Id refers to how a node or relationship is stored internally.
 // The Id is actually the index at which the node lives inside the `buf` array.
@@ -54,7 +58,7 @@ impl<'a, T: 'a + Eq + Hash + Clone> Data<T> {
     pub fn descendants_iter<'fc, Q: ?Sized + 'fc>(
         &self,
         nodes: impl IntoIterator<Item = &'fc Q>,
-    ) -> impl Iterator<Item = (usize, &T)>
+    ) -> impl Iterator<Item = &T>
     where
         T: Borrow<Q>,
         Q: Hash + Eq,
@@ -65,7 +69,7 @@ impl<'a, T: 'a + Eq + Hash + Clone> Data<T> {
             .flatten()
             .cloned()
             .collect();
-        LazyBFS::new(nodes, &self).map(|(level, node_id)| (level, &self.id_label_map[&node_id]))
+        LazyBFS::new(nodes, &self).map(|node_id| &self.id_label_map[&node_id])
     }
 }
 
@@ -125,27 +129,21 @@ impl<T: Eq + Hash + Clone> FromIterator<(T, T)> for Data<T> {
 }
 
 struct LazyBFS<'a, T: Eq + Hash + Clone> {
-    curr_level: Vec<NodeId>,
-    next_level: Vec<NodeId>,
-    visited_nodes: HashSet<NodeId>,
-    idx: usize, // index is always between 0 and `self.curr_level.len() - 1`
-    level: usize,
+    seen: FxIndexSet<NodeId>,
     data: &'a Data<T>, // needed for `get_children_as_ids` and `id_label_map`
+    idx: usize,
     children_idx: usize,
     children_idx_max: usize,
 }
 
 impl<'a, T: Eq + Hash + Clone> LazyBFS<'a, T> {
     fn new(start_nodes: Vec<NodeId>, data: &'a Data<T>) -> Self {
-        let visited_nodes = HashSet::from_iter(start_nodes.clone());
+        let seen = FxIndexSet::from_iter(start_nodes);
 
         Self {
-            curr_level: start_nodes,
-            next_level: vec![],
-            visited_nodes,
-            idx: 0,
-            level: 2, // level 1 contains `start_nodes`, its children are already level 2
+            seen,
             data,
+            idx: 0,
             children_idx: 0,
             children_idx_max: 0,
         }
@@ -154,14 +152,13 @@ impl<'a, T: Eq + Hash + Clone> LazyBFS<'a, T> {
 
 impl<T: Eq + Hash + Clone> LazyBFS<'_, T> {
     #[inline]
-    fn find_next_child(&mut self) -> Option<(usize, NodeId)> {
+    fn find_next_child(&mut self) -> Option<NodeId> {
         while self.children_idx != self.children_idx_max {
             let node_id = self.data.buf[self.children_idx];
             self.children_idx += 1;
 
-            if self.visited_nodes.insert(node_id) {
-                self.next_level.push(node_id);
-                return Some((self.level, node_id));
+            if self.seen.insert(node_id) {
+                return Some(node_id);
             }
         }
         None
@@ -169,7 +166,7 @@ impl<T: Eq + Hash + Clone> LazyBFS<'_, T> {
 }
 
 impl<T: Eq + Hash + Clone> Iterator for LazyBFS<'_, T> {
-    type Item = (usize, NodeId);
+    type Item = NodeId;
 
     #[inline(always)]
     fn next(&mut self) -> Option<Self::Item> {
@@ -178,24 +175,10 @@ impl<T: Eq + Hash + Clone> Iterator for LazyBFS<'_, T> {
         }
 
         // find at least one child that we haven't seen before, and return that
-        loop {
-            if self.idx >= self.curr_level.len() {
-                // if we're at the end of the current level and there is no next level; then we are finished.
-                if self.next_level.is_empty() {
-                    return None;
-                }
-
-                // self.curr_level = vec![];  // this vs `self.curr_level.clear()` ??
-                self.curr_level.clear();
-                std::mem::swap(&mut self.curr_level, &mut self.next_level);
-
-                self.level += 1;
-                self.idx = 0;
-            }
-
-            let node_id = usize::try_from(self.curr_level[self.idx]).unwrap();
+        while let Some(&node) = self.seen.get_index(self.idx) {
             self.idx += 1;
 
+            let node_id = usize::try_from(node).unwrap();
             let n_children = usize::try_from(self.data.buf[node_id]).unwrap();
             if n_children != 0 {
                 let offset = node_id + 1;
@@ -207,6 +190,37 @@ impl<T: Eq + Hash + Clone> Iterator for LazyBFS<'_, T> {
                 }
             }
         }
+        return None
+
+        // loop {
+            // if self.idx >= self.curr_level.len() {
+            //     // if we're at the end of the current level and there is no next level; then we are finished.
+            //     if self.next_level.is_empty() {
+            //         return None;
+            //     }
+            //
+            //     // self.curr_level = vec![];  // this vs `self.curr_level.clear()` ??
+            //     self.curr_level.clear();
+            //     std::mem::swap(&mut self.curr_level, &mut self.next_level);
+            //
+            //     self.level += 1;
+            //     self.idx = 0;
+            // }
+
+            // let node_id = usize::try_from(self.curr_level[self.idx]).unwrap();
+            // self.idx += 1;
+            //
+            // let n_children = usize::try_from(self.data.buf[node_id]).unwrap();
+            // if n_children != 0 {
+            //     let offset = node_id + 1;
+            //     self.children_idx = offset;
+            //     self.children_idx_max = offset + n_children;
+            //
+            //     if let child @ Some(_) = self.find_next_child() {
+            //         return child;
+            //     }
+            // }
+        // }
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
